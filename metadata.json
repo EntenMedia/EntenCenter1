@@ -1,0 +1,6 @@
+{
+  "name": "EntenCenter",
+  "description": "Zentrales Zero-Local-Footprint NAS-Mediacenter mit Gummi-Enten-Maskottchen, DE-Serienkalender, Statistiken, Kotlin/Python-Code-Studio und Gemini-Assistent.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
