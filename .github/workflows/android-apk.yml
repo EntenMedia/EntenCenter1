@@ -1,0 +1,155 @@
+name: Build Signed EntenCenter APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: 'App-Version (z. B. 1.2.0)'
+        required: false
+        default: ''
+      build_type:
+        description: 'Build-Variante'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    name: Build & Sign Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install Web Dependencies & Build Frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Bundle Web Assets into Android App
+        run: |
+          rm -rf app/src/main/assets/www
+          mkdir -p app/src/main/assets/www
+          cp -r dist/* app/src/main/assets/www/
+
+      - name: Setup Java 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare Release Keystore
+        if: ${{ inputs.build_type != 'debug' }}
+        id: keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 --decode > "${{ runner.temp }}/entencenter-release.p12"
+            echo "keystore_path=${{ runner.temp }}/entencenter-release.p12" >> "$GITHUB_OUTPUT"
+          elif [ -f "app/entencenter-release.p12" ]; then
+            echo "keystore_path=${{ github.workspace }}/app/entencenter-release.p12" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Kein Release-Keystore gefunden. Hinterlege ANDROID_KEYSTORE_BASE64 in den GitHub Repository Secrets oder lege app/entencenter-release.p12 ins Repository."
+            exit 1
+          fi
+
+          if [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ]; then
+            echo "::error::Fehlende Signierungs-Secrets! Bitte setze ANDROID_KEYSTORE_PASSWORD und ANDROID_KEY_ALIAS (sowie optional ANDROID_KEY_PASSWORD) unter Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      - name: Build Signed Release APK
+        if: ${{ inputs.build_type != 'debug' }}
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ steps.keystore.outputs.keystore_path }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD || secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          chmod +x ./gradlew
+          VERSION_NAME="${{ inputs.version_name }}"
+          if [ -z "$VERSION_NAME" ]; then
+            if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+              VERSION_NAME="${GITHUB_REF_NAME#v}"
+            else
+              VERSION_NAME="1.0.${{ github.run_number }}"
+            fi
+          fi
+          ./gradlew assembleRelease \
+            -PversionCode="${{ github.run_number }}" \
+            -PversionName="$VERSION_NAME" \
+            --no-daemon
+
+          APK_SOURCE="app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$APK_SOURCE" ]; then
+            echo "::error::Signierte Release-APK wurde nicht erzeugt ($APK_SOURCE fehlt)."
+            exit 1
+          fi
+
+          mkdir -p build-artifacts
+          cp "$APK_SOURCE" build-artifacts/EntenCenter-release-signed.apk
+
+      - name: Verify APK Signature
+        if: ${{ inputs.build_type != 'debug' }}
+        run: |
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -n 1)
+          "$APKSIGNER" verify --verbose --print-certs build-artifacts/EntenCenter-release-signed.apk
+
+      - name: Upload Signed Release APK Artifact
+        if: ${{ inputs.build_type != 'debug' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-release-apk
+          path: build-artifacts/EntenCenter-release-signed.apk
+          retention-days: 30
+
+      - name: Build Debug APK
+        if: ${{ inputs.build_type == 'debug' }}
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug \
+            -PversionCode="${{ github.run_number }}" \
+            -PversionName="1.0.${{ github.run_number }}-debug" \
+            --no-daemon
+          mkdir -p build-artifacts
+          cp app/build/outputs/apk/debug/app-debug.apk build-artifacts/EntenCenter-debug.apk
+
+      - name: Upload Debug APK Artifact
+        if: ${{ inputs.build_type == 'debug' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: entencenter-debug-apk
+          path: build-artifacts/EntenCenter-debug.apk
+          retention-days: 14
+
+      - name: Attach Signed APK to GitHub Release (on Tag)
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && inputs.build_type != 'debug' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build-artifacts/EntenCenter-release-signed.apk
